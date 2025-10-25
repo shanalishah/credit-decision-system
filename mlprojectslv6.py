@@ -6,7 +6,7 @@ import shap
 import matplotlib.pyplot as plt
 
 # =========================
-# 0. PAGE CONFIG
+# PAGE CONFIG
 # =========================
 st.set_page_config(
     page_title="HELOC Underwriting Assistant",
@@ -14,7 +14,7 @@ st.set_page_config(
 )
 
 # =========================
-# 1. LOAD MODEL + DATA
+# LOAD MODEL + DATA
 # =========================
 MODEL_PATH = "random_forest_heloc.pkl"
 DATA_PATH = "heloc_dataset_cleaned.csv"
@@ -25,7 +25,7 @@ df = pd.read_csv(DATA_PATH)
 X = df.drop(columns=["RiskPerformance"])
 y = df["RiskPerformance"]
 
-# Business-friendly names for UI / explanations
+# Mapping raw model features -> business readable labels
 FEATURE_MAPPING = {
     "ExternalRiskEstimate": "Risk Estimate Score",
     "MSinceOldestTradeOpen": "Months Since Oldest Credit Account",
@@ -52,38 +52,69 @@ FEATURE_MAPPING = {
     "PercentTradesWBalance": "% Trades w/ Balance"
 }
 
-# Initialize SHAP explainer once
+# Pre-build SHAP explainer
 explainer = shap.TreeExplainer(best_rf)
 
 # =========================
-# 2. HELPER FUNCTIONS
+# HELPER FUNCTIONS
 # =========================
+
+def _align_vectors(one_row_df, shap_for_row):
+    """
+    Make sure features, applicant values, and SHAP values all have the same length.
+    Returns aligned lists/arrays so downstream code never crashes.
+    """
+    # canonical feature list from training
+    feature_list = list(X.columns)
+
+    # applicant values in that order
+    applicant_values = one_row_df.iloc[0][feature_list].tolist()
+
+    # flatten SHAP and force into python list
+    shap_flat = np.array(shap_for_row).reshape(-1).tolist()
+
+    # lengths
+    n_features = len(feature_list)
+    n_values = len(applicant_values)
+    n_shap = len(shap_flat)
+
+    min_len = min(n_features, n_values, n_shap)
+
+    # truncate consistently
+    feature_list = feature_list[:min_len]
+    applicant_values = applicant_values[:min_len]
+    shap_flat = shap_flat[:min_len]
+
+    # business-friendly names
+    friendly_list = [FEATURE_MAPPING.get(f, f) for f in feature_list]
+
+    return feature_list, friendly_list, applicant_values, np.array(shap_flat)
+
 
 def make_prediction(one_row_df):
     """
+    Run model prediction on a single-row DF.
     Returns:
-        pred_class: 0/1
-        proba: float in [0,1] = P(approved)
-        shap_row: 1D np.array of SHAP values per feature (len == len(X.columns))
+        pred_class: int (0=deny,1=approve)
+        proba: float (P(approve))
+        shap_row: np.ndarray (1D, can be longer than features but we'll align later)
+        aligned_row_df: row reordered to match X.columns
     """
-    # ensure column order matches training exactly
+    # ensure same columns/order as training data
     one_row_df = one_row_df[X.columns]
 
     pred_class = best_rf.predict(one_row_df)[0]
-    proba = best_rf.predict_proba(one_row_df)[0, 1]  # "approved" class probability
+    proba = best_rf.predict_proba(one_row_df)[0, 1]  # probability of class 1 (approved)
 
     shap_values = explainer.shap_values(one_row_df)
 
-    # shap_values may be:
-    # - list of arrays (for classifiers): [class0, class1]
-    # - single array
+    # TreeExplainer on classifier often returns list: [class0, class1]
     if isinstance(shap_values, list):
-        # choose class 1 ("approved") side for interpretation
-        shap_for_row = shap_values[1]  # shape (1, n_features)
+        shap_for_row = shap_values[1]  # explanation towards "approved"
     else:
-        shap_for_row = shap_values  # shape (1, n_features) or (n_features,)
+        shap_for_row = shap_values
 
-    # force 1D vector
+    # force 1D
     shap_for_row = np.array(shap_for_row).reshape(-1)
 
     return pred_class, proba, shap_for_row, one_row_df
@@ -91,17 +122,23 @@ def make_prediction(one_row_df):
 
 def build_risk_summary(one_row_df, shap_for_row):
     """
-    Creates short bullet-point reasons a credit officer understands.
-    Falls back to generic bullets if anything goes wrong.
+    Generate plain-English bullets about top drivers.
+    It's safe: if anything goes weird, returns fallback bullets.
     """
     try:
-        # We'll build an aligned frame of features, shap impact, and actual values
+        (
+            feature_list,
+            friendly_list,
+            applicant_values,
+            shap_used
+        ) = _align_vectors(one_row_df, shap_for_row)
+
         impact_df = pd.DataFrame({
-            "feature": list(X.columns),
-            "friendly": [FEATURE_MAPPING.get(f, f) for f in X.columns],
-            "shap_value": shap_for_row.tolist(),
-            "abs_impact": np.abs(shap_for_row).tolist(),
-            "raw_value": one_row_df.iloc[0].tolist()
+            "feature": feature_list,
+            "friendly": friendly_list,
+            "raw_value": applicant_values,
+            "shap_value": shap_used,
+            "abs_impact": np.abs(shap_used)
         }).sort_values("abs_impact", ascending=False)
 
         bullets = []
@@ -109,13 +146,11 @@ def build_risk_summary(one_row_df, shap_for_row):
             friendly = r["friendly"]
             val = r["raw_value"]
 
-            # build a readable value string
             if isinstance(val, (int, float, np.integer, np.floating)):
                 val_str = f"{val:.0f}"
             else:
                 val_str = str(val)
 
-            # heuristic messaging based on feature meaning
             if "Utilization" in friendly:
                 bullets.append(
                     f"{friendly} is high ({val_str}%), which increases overall credit risk."
@@ -135,7 +170,6 @@ def build_risk_summary(one_row_df, shap_for_row):
         return bullets
 
     except Exception:
-        # Safe fallback so app never crashes in front of stakeholders
         return [
             "High revolving utilization is increasing risk.",
             "Recent delinquency / inquiries indicate credit stress.",
@@ -145,32 +179,47 @@ def build_risk_summary(one_row_df, shap_for_row):
 
 def build_drivers_table(one_row_df, shap_for_row):
     """
-    Returns a dataframe of the top ~5 drivers:
-    - Friendly feature name
-    - Applicant's value
-    - SHAP impact (positive supports approval, negative hurts)
+    Build a compliance/audit-friendly table:
+    Feature | Applicant Value | Impact on Approval
+    Always aligned + truncated so pandas doesn't explode.
     """
+    (
+        feature_list,
+        friendly_list,
+        applicant_values,
+        shap_used
+    ) = _align_vectors(one_row_df, shap_for_row)
+
     drivers_df = pd.DataFrame({
-        "Feature": [FEATURE_MAPPING.get(f, f) for f in X.columns],
-        "Applicant Value": one_row_df.iloc[0].tolist(),
-        "Impact on Approval": shap_for_row
+        "Feature": friendly_list,
+        "Applicant Value": applicant_values,
+        "Impact on Approval": shap_used
     })
 
-    # Sort rows by absolute impact descending, then keep top 5
-    order = np.argsort(-np.abs(shap_for_row))
-    drivers_df = drivers_df.iloc[order].head(5)
+    # sort by |impact|
+    order = np.argsort(-np.abs(shap_used))
+    drivers_df = drivers_df.iloc[order].head(5).reset_index(drop=True)
 
     return drivers_df
 
 
 def shap_bar_plot(shap_for_row):
     """
-    Basic horizontal bar chart of SHAP values.
-    Kept in an expander so only technical users open it.
+    Horizontal bar chart of SHAP values.
+    This is under an expander in the UI because it's more technical.
     """
+    # For plotting we don't need alignment strictness, but it's nice
+    # to only plot what we can label clearly.
+    (
+        feature_list,
+        friendly_list,
+        applicant_values,
+        shap_used
+    ) = _align_vectors(pd.DataFrame([X.iloc[0]]), shap_for_row)
+
     plot_df = pd.DataFrame({
-        "Feature": [FEATURE_MAPPING.get(f, f) for f in X.columns],
-        "SHAP Value": shap_for_row
+        "Feature": friendly_list,
+        "SHAP Value": shap_used
     }).sort_values("SHAP Value", ascending=True)
 
     plt.figure(figsize=(8, 6))
@@ -183,9 +232,9 @@ def shap_bar_plot(shap_for_row):
 
 def build_manual_input(medians):
     """
-    Build manual input using 5-6 intuitive levers.
-    Fill the rest with median values so the model can still run.
-    Returns a 1-row DataFrame with ALL columns in X.
+    Sidebar manual input:
+    We expose a few intuitive levers and fill the rest with medians.
+    Returns a 1-row DataFrame with all model features.
     """
     RevolvingUtil = st.sidebar.number_input(
         "Revolving Utilization (%)",
@@ -223,10 +272,10 @@ def build_manual_input(medians):
         value=float(medians["ExternalRiskEstimate"])
     )
 
-    # Start from all medians
+    # start with medians for every feature
     user_row = medians.to_frame().T  # shape (1, n_features)
 
-    # Override the features we exposed
+    # override the ones we asked for
     user_row["NetFractionRevolvingBurden"] = RevolvingUtil
     user_row["NumTrades90Ever2DerogPubRec"] = Recent90Delq
     user_row["NumInqLast6M"] = Inquiries6M
@@ -234,7 +283,7 @@ def build_manual_input(medians):
     user_row["PercentTradesNeverDelq"] = PctNeverDelq
     user_row["ExternalRiskEstimate"] = RiskScore
 
-    # Make sure order matches X
+    # ensure same col order
     user_row = user_row[X.columns]
 
     return user_row
@@ -242,8 +291,9 @@ def build_manual_input(medians):
 
 def build_sample_input():
     """
-    Let user pick an example row from the dataset.
-    For a nicer demo you can create a synthetic ApplicantID in your CSV.
+    Sidebar sample input mode:
+    User picks a row index from the historical dataset.
+    You can later replace this with a dropdown of fake ApplicantIDs.
     """
     st.sidebar.markdown("### Choose Sample Applicant")
     sample_index = st.sidebar.number_input(
@@ -255,15 +305,13 @@ def build_sample_input():
     )
 
     user_row = X.iloc[[sample_index]].copy()
-    # force correct column order just in case
     user_row = user_row[X.columns]
     return user_row, sample_index
 
 
 # =========================
-# 3. APP LAYOUT
+# UI HEADER
 # =========================
-
 st.title("HELOC Underwriting Assistant")
 st.caption(
     "Prototype — not a production credit decision engine. "
@@ -276,7 +324,9 @@ st.markdown(
     "highlights the top risk drivers behind that decision."
 )
 
-# --- SIDEBAR: INPUT MODE
+# =========================
+# SIDEBAR INPUT MODE
+# =========================
 st.sidebar.header("Applicant Input")
 
 mode = st.sidebar.radio(
@@ -294,7 +344,9 @@ else:
 
 run_pred = st.sidebar.button("Run Underwriting Decision")
 
-# --- MAIN CONTENT
+# =========================
+# MAIN OUTPUT AREA
+# =========================
 col1, col2, col3 = st.columns(3)
 
 if run_pred:
@@ -303,7 +355,15 @@ if run_pred:
     decision_text = "Approved" if pred_class == 1 else "Denied"
     approval_pct = proba * 100.0
 
-    # ===== Card 1: Decision =====
+    # (Optional but helpful while you're polishing: shows if SHAP aligns with features)
+    st.caption(
+        f"Debug info (will not be in production): "
+        f"features={len(X.columns)}, "
+        f"shap={len(np.array(shap_row).reshape(-1))}, "
+        f"row_vals={aligned_user_row.shape[1]}"
+    )
+
+    # ----- Card 1: Decision -----
     with col1:
         st.subheader("Decision")
         st.metric(
@@ -315,17 +375,16 @@ if run_pred:
         if pred_class == 1:
             st.caption("This applicant meets automated approval criteria.")
         else:
-            # You can tune this wording for your story
             st.caption("This applicant would be routed to manual review / collateral reassessment.")
 
-    # ===== Card 2: Risk Summary =====
+    # ----- Card 2: Risk Summary -----
     bullets = build_risk_summary(aligned_user_row, shap_row)
     with col2:
         st.subheader("Key Risk / Support Factors")
         for b in bullets:
             st.write(f"- {b}")
 
-    # ===== Card 3: Audit / Compliance View =====
+    # ----- Card 3: Compliance / Audit Drivers -----
     drivers_df = build_drivers_table(aligned_user_row, shap_row)
     with col3:
         st.subheader("Top Drivers (For Audit)")
@@ -334,7 +393,7 @@ if run_pred:
             use_container_width=True
         )
 
-    # ===== Optional Technical Details =====
+    # ----- Technical Explainability (Expandable) -----
     with st.expander("Show Model Explanation Chart (SHAP)"):
         fig = shap_bar_plot(shap_row)
         st.pyplot(fig)
