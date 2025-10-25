@@ -278,7 +278,7 @@ def build_manual_input(medians):
 # =========================
 st.title("HELOC Underwriting Assistant")
 st.caption(
-    "Prototype — not a production credit decision engine. "
+    "Prototype - not a production credit decision engine. "
     "Model trained on historical HELOC performance data. "
     "Outputs are for demonstration only."
 )
